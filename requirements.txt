@@ -1,0 +1,12 @@
+# Minimal, installable dependency set for run.py, the benchmarked entry point.
+# run.py imports ONLY torch and numpy -- everything else here is for
+# training/evaluation and is never touched during inference.
+
+# --- inference ---------------------------------------------------------------
+torch==2.13.0
+numpy==2.4.4
+
+# --- training / evaluation (not needed to run inference) --------------------
+lpips==0.1.4            # perceptual loss and reported metric
+scikit-image==0.26.0    # SSIM
+tqdm==4.70.0
