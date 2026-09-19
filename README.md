@@ -219,21 +219,6 @@ forced; `auto` below and above the threshold; forced self-check failure; only th
 importable; 128, 256 and 100 pixel images in one directory; and (with
 `--with-build`) an on-the-fly build of the engine. All eleven runs (the reference plus ten scenarios) passed on the RTX 3050 (Python 3.12, torch 2.13.0+cu132, TensorRT 11.3.0.99).
 
-### Compute study (not shipped)
-
-Profiling this checkpoint on the 3050 (`../arch_analysis/README.md`) shows that parameters
-and time sit in different places: the 256-channel level holds 71% of the parameters but
-19% of the GPU time, while full resolution holds 3% of the parameters and 47% of the time.
-That is why the earlier 2-level ablation (74% fewer parameters) ran only 9% faster. Two
-results came out of it, neither of them in this submission:
-
-- A fused LayerNorm makes this same checkpoint 17% faster on the 3050 (22.1 to 18.5
-  ms/image, same output to fp16 rounding). It lives in `../model_2.py`, not in
-  `models/minirestormer.py`.
-- Model E (full-resolution width 32 and one block per side, retrained on the same 5862
-  pairs) runs at 11.4 ms/image but scores PSNR 23.997 / SSIM 0.6387 / LPIPS 0.1522 against
-  24.039 / 0.6408 / 0.1493 here, so the submitted checkpoint stays.
-
 ## Reproducing the checkpoint
 
 ```bash
