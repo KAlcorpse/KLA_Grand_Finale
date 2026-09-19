@@ -49,6 +49,28 @@ facts rather than by guesswork:
     are grouped by shape so each batch is uniform, and any size is accepted:
     inputs are reflect-padded up to a multiple of 8 for the two stride-2 stages
     and cropped back afterwards.
+  * TensorRT is optional (`--backend auto|trt|torch`, `--trt-build never|auto`).
+    An engine is tied to one GPU architecture and one TensorRT version, so it is
+    looked up by name in models/ (see trt_backend.py). If one exists it runs the
+    128x128 inputs from TRT_MIN_IMAGES images up; on ANY problem --
+    tensorrt missing, no/corrupt/mismatched engine, failed first-batch self-check
+    against the checkpoint, NaN output, an input size with no engine -- the
+    affected images run on models/best.pth instead, so the output is always
+    produced. Measured on the RTX 3050 (whole run.py, val images repeated, fresh
+    process per row, fp16 both):
+
+        N        torch total s    trt total s      (fixed batch 32)
+           30       2.95            3.58
+          120       5.21            4.91
+          480      13.91           11.71
+         1200      30.25           25.06
+
+        TensorRT saves ~4.5 ms/img and costs ~0.5 s of extra setup, so it breaks
+        even at roughly 100-130 images; TRT_MIN_IMAGES = 200 leaves a margin.
+
+    The H100 was not available: its break-even is unmeasured and probably higher
+    (a faster GPU saves fewer ms per image against the same ~0.7 s of extra
+    setup). Re-measure there with `--backend torch` vs `--backend trt`.
 """
 import time
 
@@ -65,6 +87,24 @@ import numpy as np
 # whether it is worth it depends only on how many images there are. Chosen at
 # runtime from the input count. See the module docstring for the measurement.
 BENCHMARK_MIN_IMAGES = 10000
+
+# TensorRT costs a fixed startup (import + engine load + self-check) and saves
+# time per image, so like cuDNN autotuning it only pays off past some image
+# count. `--backend auto` uses an engine only from this many images up;
+# `--backend trt` ignores it. RTX 3050 break-even measured at ~100-130 images (README);
+# 200 leaves a margin. The H100 crossover could not be measured and is likely
+# higher, since a faster GPU saves fewer ms per image against the same setup.
+TRT_MIN_IMAGES = 200
+# An engine is only trusted if, on the first batch, it agrees with the
+# checkpoint's own fp16 output to this mean absolute error (images are in
+# [0,1]; the shipped fp16 engine measures ~2e-4, a wrong engine is far above).
+TRT_SELFCHECK_TOL = 3e-3
+
+# Fixed batch size, used by both the TensorRT and the .pth path. Memory at 128x128 is
+# ~2.2 GB for the whole process at 32 on the RTX 3050 (README), and 32 is also the
+# largest batch of the shipped engines. An OOM still halves it. `--batch 0` restores
+# the old free-VRAM estimate (auto_batch below).
+DEFAULT_BATCH = 32
 
 NPY_EXT = (".npy",)
 IMG_EXT = (".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp")
@@ -112,6 +152,51 @@ def _write(path, arr, meta):
 BYTES_PER_INPUT_PIXEL = 4096
 
 
+def load_trt_runners(here, groups, build, backend, log, warn):
+    """One TensorRT Runner per square input size that has a usable engine.
+
+    Returns {} (=> everything runs on the .pth) on any problem. Nothing heavy is
+    imported unless an engine file actually exists or a build was requested, so
+    a machine with no engine pays no TensorRT startup cost.
+    """
+    sizes = sorted({h for (h, w) in groups if h == w})
+    try:
+        sys.path.insert(0, here)
+        import trt_backend
+        sizes = [s for s in sizes if s in trt_backend.SIZES]
+        if not build:
+            have = [s for s in sizes if trt_backend.has_candidates(s)]
+            for s in sizes:
+                if s not in have:
+                    (warn if backend == "trt" else log)(
+                        f"[trt] no engine for {s}x{s} on this GPU (build one: "
+                        f"python trt_backend.py build --size {s}, or pass --trt-build auto); "
+                        f"using the PyTorch checkpoint")
+            sizes = have
+        if not sizes:
+            return {}
+        import tensorrt  # noqa: F401
+    except Exception as e:
+        warn(f"[trt] TensorRT unavailable ({type(e).__name__}: {e}); using the PyTorch checkpoint")
+        return {}
+    if build:
+        # Build every missing engine BEFORE loading any: a loaded engine holds a
+        # large activation buffer, and a build needs that memory free.
+        for s in sizes:
+            if not trt_backend.has_candidates(s):
+                try:
+                    trt_backend.build_engine(s, log=log)
+                except Exception as e:
+                    warn(f"[trt] {s}x{s}: engine build failed ({e}); using the PyTorch checkpoint for this size")
+    runners = {}
+    for s in sizes:
+        try:
+            runners[s] = trt_backend.load_runner(s, build=build, log=log)
+        except Exception as e:
+            warn(f"[trt] {s}x{s}: {e}; using the PyTorch checkpoint for this size")
+    return runners
+
+
 def auto_batch(torch, device, pixels, requested):
     if requested:
         return max(1, requested)
@@ -127,13 +212,24 @@ def main():
     ap.add_argument("output_dir", help="directory to write restored images into")
     ap.add_argument("--ckpt", default=None,
                     help="checkpoint (default: models/best.pth next to this script)")
-    ap.add_argument("--batch", type=int, default=0,
-                    help="images per forward pass; 0 = size it from free VRAM")
+    ap.add_argument("--batch", type=int, default=DEFAULT_BATCH,
+                    help=f"images per forward pass (default {DEFAULT_BATCH}, fixed for both the "
+                         f"TensorRT and .pth paths; an out-of-memory error halves it). "
+                         f"0 = size it from free VRAM instead")
     ap.add_argument("--fp32", action="store_true", help="disable fp16 autocast")
     ap.add_argument("--device", default=None, help="cuda | cpu (default: auto)")
     ap.add_argument("--cudnn-benchmark", choices=("auto", "on", "off"), default="auto",
                     help="cuDNN autotuning. auto = enable only when there are enough "
                          "images to amortise the one-off autotune cost")
+    ap.add_argument("--backend", choices=("auto", "trt", "torch"), default=None,
+                    help="auto (default, or $KLA_BACKEND) = TensorRT engine when one exists for "
+                         "this GPU and there are enough images, else the .pth; trt = try the "
+                         "engine regardless of image count; torch = never touch TensorRT. Any "
+                         "TensorRT problem falls back to the .pth automatically.")
+    ap.add_argument("--trt-build", choices=("never", "auto"), default=None,
+                    help="when no engine exists for this GPU: never (default, or $KLA_TRT_BUILD) "
+                         "= use the .pth, auto = build one from models/model_fp16_<size>.onnx "
+                         "first (1-3 min, cached for later runs)")
     ap.add_argument("--quiet", action="store_true", help="suppress the timing summary")
     args = ap.parse_args()
 
@@ -212,12 +308,62 @@ def main():
     for i, a in enumerate(arrays):
         groups.setdefault(a.shape, []).append(i)
 
+    def log(msg):
+        if not args.quiet:
+            print(msg, file=sys.stderr)
+
+    def warn(msg):
+        print(msg, file=sys.stderr)
+
+    # Optional TensorRT engines, one per square input size. Anything that goes
+    # wrong (no tensorrt, no engine for this GPU, wrong TensorRT version,
+    # corrupt file, failed self-check, NaN output) just means that size runs on
+    # the .pth checkpoint instead; the result is the same restoration either way.
+    backend = args.backend or os.environ.get("KLA_BACKEND", "auto")
+    build = (args.trt_build or os.environ.get("KLA_TRT_BUILD", "never")) == "auto"
+    runners = {}
+    if backend == "trt" or (backend == "auto" and len(names) >= TRT_MIN_IMAGES):
+        if device.type != "cuda" or args.fp32:
+            if backend == "trt":
+                warn("[trt] TensorRT engines are fp16 and need CUDA; using the PyTorch checkpoint")
+        else:
+            runners = load_trt_runners(here, groups, build, backend, log, warn)
+    elif backend == "auto":
+        log(f"[trt] {len(names)} images < TRT_MIN_IMAGES ({TRT_MIN_IMAGES}); using the PyTorch checkpoint")
+    t_trt = time.perf_counter()
+
+    counts = {"trt": 0, "torch": 0}
+    verified = set()
+
+    def torch_forward(x):
+        if device.type == "cuda":
+            x = x.to(memory_format=torch.channels_last)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+            return model(x)
+
+    def trt_forward(runner, x, first):
+        y = runner(x)
+        if not bool(torch.isfinite(y).all()):
+            raise RuntimeError("engine produced NaN/Inf")
+        if first:
+            # Cross-check the first batch against the checkpoint itself, so a
+            # stale, mismatched or mis-built engine can never silently ship.
+            n = min(2, x.shape[0])
+            diff = (y[:n] - torch_forward(x[:n]).float()).abs().mean(dim=(1, 2, 3)).max().item()
+            if diff > TRT_SELFCHECK_TOL:
+                raise RuntimeError(f"engine output differs from the checkpoint "
+                                   f"(mean |diff| {diff:.2e} > {TRT_SELFCHECK_TOL:.0e})")
+        return y
+
     writes = []
     with torch.inference_mode():
         for shape, idxs in sorted(groups.items()):
             h, w = shape
             ph, pw = (-h) % PAD_TO, (-w) % PAD_TO
+            runner = runners.get(h) if h == w else None
             bs = auto_batch(torch, device, h * w, args.batch)
+            if runner is not None:
+                bs = min(bs, runner.max_batch)
             pos = 0
             while pos < len(idxs):
                 chunk = idxs[pos:pos + bs]
@@ -226,10 +372,20 @@ def main():
                     x = x.unsqueeze(1).to(device, non_blocking=True)
                     if ph or pw:
                         x = F.pad(x, (0, pw, 0, ph), mode="reflect")
-                    if device.type == "cuda":
-                        x = x.to(memory_format=torch.channels_last)
-                    with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-                        y = model(x)
+                    y = None
+                    if runner is not None:
+                        try:
+                            y = trt_forward(runner, x, h not in verified)
+                            verified.add(h)
+                            counts["trt"] += len(chunk)
+                        except Exception as e:
+                            warn(f"[trt] {h}x{w}: {e}; falling back to the PyTorch checkpoint")
+                            runners.pop(h, None)
+                            runner = None
+                            bs = auto_batch(torch, device, h * w, args.batch)
+                    if y is None:
+                        y = torch_forward(x)
+                        counts["torch"] += len(chunk)
                     y = y.float().clamp_(0, 1)
                     if ph or pw:
                         y = y[..., : h * 2, : w * 2]
@@ -257,9 +413,12 @@ def main():
         print(f"  import+init {t_import - _T0:6.2f} s\n"
               f"  build model {t_model - t_import:6.2f} s\n"
               f"  read        {t_read - t_model:6.2f} s  (overlapped with the above)\n"
-              f"  inference   {t_infer - t_read:6.2f} s  ({(t_infer - t_read) / n * 1e3:.2f} ms/img)\n"
+              f"  trt setup   {t_trt - t_read:6.2f} s\n"
+              f"  inference   {t_infer - t_trt:6.2f} s  ({(t_infer - t_trt) / n * 1e3:.2f} ms/img)\n"
               f"  write flush {t_end - t_infer:6.2f} s\n"
-              f"  TOTAL       {t_end - _T0:6.2f} s", file=sys.stderr)
+              f"  TOTAL       {t_end - _T0:6.2f} s\n"
+              f"  backend     TensorRT {counts['trt']} img, PyTorch {counts['torch']} img",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":

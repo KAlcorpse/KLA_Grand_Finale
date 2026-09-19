@@ -10,3 +10,9 @@ numpy==2.4.4
 lpips==0.1.4            # perceptual loss and reported metric
 scikit-image==0.26.0    # SSIM
 tqdm==4.70.0
+
+# --- optional TensorRT backend (run.py works without it and falls back to the .pth) ---
+# Engines in models/ are tied to the TensorRT version in their file name, so install the
+# matching build (-cu12 or -cu13 to match the machine's CUDA), e.g.
+#   pip install tensorrt-cu13==11.3.0.99
+# `python trt_backend.py export` (re-creating the ONNX) additionally needs: onnx, onnxscript
